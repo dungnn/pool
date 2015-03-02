@@ -2,7 +2,7 @@ package pool
 
 import (
 	"errors"
-	"fmt"
+	_ "fmt"
 	"net"
 	"sync"
 )
@@ -15,10 +15,12 @@ type channelPool struct {
 
 	// net.Conn generator
 	factory Factory
+	borrow  Borrow
 }
 
 // Factory is a function to create new connections.
 type Factory func() (net.Conn, error)
+type Borrow func(net.Conn) error
 
 // NewChannelPool returns a new pool based on buffered channels with an initial
 // capacity and maximum capacity. Factory is used when initial capacity is
@@ -34,6 +36,7 @@ func NewChannelPool(initialCap, maxCap int, factory Factory) (Pool, error) {
 	c := &channelPool{
 		conns:   make(chan net.Conn, maxCap),
 		factory: factory,
+		borrow:  nil,
 	}
 
 	// create initial connections, if something goes wrong,
@@ -41,8 +44,7 @@ func NewChannelPool(initialCap, maxCap int, factory Factory) (Pool, error) {
 	for i := 0; i < initialCap; i++ {
 		conn, err := factory()
 		if err != nil {
-			c.Close()
-			return nil, fmt.Errorf("factory is not able to fill the pool: %s", err)
+			continue
 		}
 		c.conns <- conn
 	}
@@ -50,6 +52,29 @@ func NewChannelPool(initialCap, maxCap int, factory Factory) (Pool, error) {
 	return c, nil
 }
 
+func NewChannelPoolWithBorrow(initialCap, maxCap int, factory Factory, borrow Borrow) (Pool, error) {
+	if initialCap < 0 || maxCap <= 0 || initialCap > maxCap {
+		return nil, errors.New("invalid capacity settings")
+	}
+
+	c := &channelPool{
+		conns:   make(chan net.Conn, maxCap),
+		factory: factory,
+		borrow:  borrow,
+	}
+
+	// create initial connections, if something goes wrong,
+	// just close the pool error out.
+	for i := 0; i < initialCap; i++ {
+		conn, err := factory()
+		if err != nil {
+			continue
+		}
+		c.conns <- conn
+	}
+
+	return c, nil
+}
 func (c *channelPool) getConns() chan net.Conn {
 	c.mu.Lock()
 	conns := c.conns
@@ -68,19 +93,27 @@ func (c *channelPool) Get() (net.Conn, error) {
 
 	// wrap our connections with out custom net.Conn implementation (wrapConn
 	// method) that puts the connection back to the pool if it's closed.
-	select {
-	case conn := <-conns:
-		if conn == nil {
-			return nil, ErrClosed
-		}
+	var (
+		conn net.Conn
+		err  error
+	)
+	for {
+		select {
+		case conn = <-conns:
+			if conn == nil {
+				return nil, ErrClosed
+			}
+			if c.borrow != nil && c.borrow(conn) != nil {
+				continue
+			}
 
-		return c.wrapConn(conn), nil
-	default:
-		conn, err := c.factory()
-		if err != nil {
-			return nil, err
+		default:
+			conn, err = c.factory()
+			if err != nil {
+				return nil, err
+			}
+			return c.wrapConn(conn), nil
 		}
-
 		return c.wrapConn(conn), nil
 	}
 }
@@ -91,7 +124,6 @@ func (c *channelPool) put(conn net.Conn) error {
 	if conn == nil {
 		return errors.New("connection is nil. rejecting")
 	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -129,3 +161,10 @@ func (c *channelPool) Close() {
 }
 
 func (c *channelPool) Len() int { return len(c.getConns()) }
+
+func (c *channelPool) Purge(conn net.Conn) error {
+	if conn == nil {
+		return errors.New("connection is nil. rejecting")
+	}
+	return conn.(poolConn).Purge()
+}

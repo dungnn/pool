@@ -25,4 +25,7 @@ type Pool interface {
 
 	// Len returns the current number of connections of the pool.
 	Len() int
+
+	// Purges connection, prevents returning it to pool
+	Purge(conn net.Conn) error
 }
